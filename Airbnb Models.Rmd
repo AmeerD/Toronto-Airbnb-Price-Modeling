@@ -1,0 +1,755 @@
+---
+title: "STA 2201H Take-Home Exam Solutions"
+author: "Ameer Dharamshi"
+date: "April 14, 2020"
+output: 
+  pdf_document:
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width=5, fig.height=3, fig.align="center") 
+```
+
+```{r include=FALSE}
+library(dplyr)
+library(tidyverse)
+library(rstan)
+library(ggplot2)
+library(ggcorrplot)
+library(rstanarm)
+library(loo)
+library(knitr)
+set.seed(2201)
+options(mc.cores=4)
+```
+
+## Introduction
+
+First, import the data:
+```{r}
+airbnb <- read.csv("airbnb.csv")
+
+#Convert price data from character to string
+airbnb <- airbnb %>% 
+  mutate(price = str_remove(price, "\\$"),
+         price = str_remove(price, ","),
+         price = as.integer(price))
+```
+
+### Data integrity checks
+
+Let's start by performing basic data integrity checks. First, lets check for duplicates.
+
+```{r}
+airbnb %>% count()
+airbnb %>% distinct() %>% count()
+airbnb <- airbnb %>% distinct()
+```
+
+There are roughly 200 duplicate rows in the dataset. While it is possible for someone to own two similar properties and list them both, having identical review scores is less plausible. We will remove the duplicates to be safe.
+
+
+
+Next, we can search for missing values.
+```{r include=FALSE}
+nrow(airbnb)
+summary(airbnb)
+```
+
+While summary is a little messy (not displayed here), it provides plenty of valuable information for us to digest. First, let's discuss the missing values. The most striking column is square_feet. Of the 23186, 23043 observations are missing values. Of the actual values, over half of them are set to 0. While the housing market in Toronto is outrageous, 0 square feet is beyond absurd! This is just more missing values. Given that the vast majority of the column is missing, we cannot expect to draw much information from the square footage of a listing. However, we have other columns such as bathrooms, accommodates, and bedrooms that offer similar information. We would expect the true square footage values to be highly correlated with these three columns. Given that they have very few missing values (10, 0, and 25 respectively), this will suffice for providing listing size information. The second set of missing values of interest are those regarding the hosts. Aside from the host_id column, all of the host specific columns are missing exactly 283 values. Note that this excludes the "N/A" entry into the host_response_time column which would appear to represent an actual "N/A" input. Perhaps this is the case where the hosts did not respond at all to guests. Before looking at review scores, let's confirm whether the 283 NA's are common between all of the host columns.
+
+```{r}
+airbnb %>% 
+  select(starts_with("host")) %>%
+  select(-host_id) %>%
+  filter_all(is.na) %>% 
+  count()
+```
+
+As we suspected, the 283 NA values are common between host columns. This indicates that there are 283 listings where we know nothing about the hosts other than their host_id which is an identifier as opposed to a characteristic.
+
+Finally, there are NA values in the review scores columns. There seems to be nearly 4500 rows with missing review information. Once again, lets see if these NA values are common between columns.
+
+```{r}
+airbnb %>% 
+  select(starts_with("review")) %>%
+  filter_all(is.na) %>% 
+  count()
+
+#airbnb %>%
+#  select(contains("review")) %>%
+#  filter(!is.na(review_scores_rating)) %>%
+#  filter_at(vars(-review_scores_rating, -number_of_reviews), any_vars(is.na(.))) %>%
+#  arrange(number_of_reviews)
+```
+
+4485 is the number of rows missing the review_scores_rating. It is a good sign that there are no instances where the rating is missing but the review subcategories are present. In most of the cases where there only certain categories missing, there is only one review. It seems likely that the single reviewer didn't bother to fill out a complete review. More strange is that there is an instance with 0 reviews but a score of 100. That seems hardly reliable. 
+
+```{r}
+airbnb %>% filter(number_of_reviews == 0 & !is.na(review_scores_rating)) %>% count()
+```
+
+From the above we do see that this is an isolated incident.
+
+A final strange observation is that the minimum price is 0. It seems odd that an airbnb listing would be free.
+```{r}
+airbnb %>% filter(price == 0) %>% count()
+```
+These 4 observations are clearly rather fishy. An entire home/apartment for free seems like an instance where a 0 was entered as opposed to a NA value. We should remove these observations once we start the analysis phase.
+
+The purpose of these integrity checks was to examine where we may want to consider removing variables or observations due to lack of information. The square_feet columns is clearly not helpful in that far too much of the column is missing. Similarly, the has_availability column is exclusively set to TRUE and thus offers no information to distinguish between listings. Regarding missing values at the observation level, if we plan to rely on the review scores, we must consider eliminating rows that do not contain any review information. The 20 observations with an overall score are more up for debate. They don't necessarily provide reliable information if there is one review and most of the subcategories are missing. However, if most of the categories are filled, we can consider interpolating the remaining ones. Finally, if we plan to rely on host data, the 283 observations with no host information should be removed. It is also worth mentioning that perhaps two of the most important determinants of price, neighbourhood_cleansed and room_type are not missing any data. In real estate, location is everything and thus we expect the neighbourhood to be a key factor in our analysis. The room_type is even more obvious: an entire house should generally be more expensive than a shared room.
+
+### Preprocessing
+
+Before starting EDA, there are a couple of simple filtering and subsetting tasks we can complete such as removing the square_feet and has_availability columns as well as shorting some column names. Also, note that host_listings_count and host_total_listings_count are identical columns. We can remove host_total_listings_count with no loss of information.
+```{r}
+airbnb <- airbnb %>%
+  select(-square_feet, -has_availability, -host_total_listings_count) %>%
+  rename(neighbourhood = neighbourhood_cleansed) %>%
+  filter(price != 0) 
+```
+
+For now, we have just removed the observations with bad price data. Given that the columns lacking review and host information do still have a price value, they are useful in assessing the distribution of listing prices and can be removed before considering the relationships between price and the missing covariates.
+
+### Exploratory Data Analysis
+
+#### Price
+
+Recalling our listing price modelling objective, let's begin by considering the distribution of price and log(price).
+```{r}
+airbnb %>% 
+  select(price) %>%
+  mutate(log.price = log(price)) %>%
+  pivot_longer(cols=price:log.price, names_to = "Type", values_to = "Price") %>%
+  ggplot(aes(x=Price, group=Type, colour=Type)) +
+  geom_density() +
+  facet_wrap(~ Type, scales="free") +
+  ggtitle("Price Density Plots") +
+  theme(legend.position = "none")
+```
+
+The above plot tells us that the price data is heavily concentrated in the under $1000 price range and even moreso in the lower end of that bucket. Noting how dramatically right-skewed the distribution is, it will be better to model the log price instead as it offers a more normal shape.
+
+#### Neighbourhoods
+
+Earlier on, we conjectured that neighbourhoods would be a defining characteristic of price as certain neighbourhoods are more desirable than others. Now, we can investigate the relationship between neighbourhood and price.
+```{r fig.height=12}
+airbnb %>% 
+  select(neighbourhood, price) %>%
+  mutate(price = log(price)) %>%
+  group_by(neighbourhood) %>%
+  summarise(min.log.price = min(price), max.log.price = max(price), 
+            mean.log.price=mean(price)) %>%
+  ggplot(aes(x=mean.log.price, y=neighbourhood)) +
+  geom_point() + 
+  geom_vline(xintercept=mean(log(airbnb$price))) +
+  geom_errorbarh(aes(xmin=min.log.price, xmax=max.log.price)) + 
+  scale_y_discrete(limits = rev(levels(airbnb$neighbourhood))) +
+  ggtitle("Neighbourhood Log Price Ranges")
+```
+
+While perhaps a little busy, the above plot confirms our suspicions. We see that there are certain neighbourhoods with mean log price much higher than the average such as Waterfront Communities - The Island and some with much lower values such as Glenfield - Jane Heights. This suggests that neighbourhood could be a good option to structure a hierarchical model with.
+
+
+#### Host Information
+
+Next, lets consider the host related columns and how they impact price. We noted above that there were 283 observations that were missing all host information. We will remove them here. First, we will need to construct a Then, we can investigate the relationship of each host variable with log price 
+
+```{r}
+airbnb <- airbnb %>% filter(!is.na(host_response_time)) %>% mutate(log.price = log(price))
+airbnb %>% 
+  select(host_response_time, log.price) %>%
+  ggplot(aes(x=host_response_time, y=log.price)) +
+  geom_boxplot() +
+  ggtitle("Host Response Time vs. Log Price")
+```
+
+The boxplots indicate that the distribution of prices by host response time have very similar central behaviour and that the differences lie in the tails. Notice that the "within an hour" category has a long upper tail suggesting that if fast response times are a proxy for a good host, good hosts charge more. The N/A category does have significant outliers in the tails which suggests a lack of insight into behaviour when response times are missing.
+
+```{r}
+airbnb %>% select(host_is_superhost, log.price) %>%
+  ggplot(aes(x=log.price, colour=host_is_superhost)) +
+  geom_density() +
+  ggtitle("Superhost Classification vs. Log Price")
+```
+
+Overlaying the density of log price between the two superhost categories allows us to examine the differences more easily. In this case, the two categories have very similar density with the only major difference being the placement of secondary modes. This suggests that there really isn't much information to be extracted from the superhost classification. For future modelling purposes, this variable has been converted from Boolean to 0-1.
+
+```{r include=FALSE}
+airbnb <- airbnb %>% mutate(host_is_superhost = ifelse(host_is_superhost == TRUE, 1, 0))
+```
+
+```{r}
+airbnb %>% select(host_listings_count, log.price) %>%
+  ggplot(aes(x=host_listings_count, y=log.price)) +
+  geom_point() +
+  ggtitle("Host Listings Count vs Log Price")
+```
+
+The host listings count does not appear to have a strong relationship with price. Note that the number of points corresponds to the number of listings not the number of hosts. Since a host with multiple listings can have multiple prices, they are represented in multiple points.
+
+Finally, the host_since variable is an ordered factor. While the ordering is chronological, we want this to be continuous as opposed to categorical. We can transform these dates into number of days the listing has been up as of December 7, 2019 - the date the data was pulled. Then we can investigate the relationship with log price to see if there are patterns such as recent postings being more expensive as compared to old postings.
+```{r}
+airbnb <- airbnb %>% 
+  mutate(host_days_active = as.numeric(as.Date("2019-12-07"))-
+           as.numeric(as.Date(host_since))) %>%
+  select(host_id:host_since, host_days_active, 
+         host_response_time:price, log.price, number_of_reviews:review_scores_value)
+
+airbnb %>% select(host_days_active, log.price) %>%
+  ggplot(aes(x=host_days_active, y=log.price)) +
+  geom_point() +
+  ggtitle("Days Active vs. Log Price")
+
+cor(airbnb$host_days_active, airbnb$log.price)
+```
+
+There does not appear to be a strong relationship between the days the host has been active and the log price. This is further confirmed by the low correlation value of 0.06. 
+
+In summary, the host information does not seem to have a strong relationship with price aside from possibly host response time acting as a proxy for host quality. However, there is no harm in using the variables in our models at first to extract any information they do contain.
+
+#### Room Types and Sizes
+
+Similar to the neighbourhood variable, we expect the room types and sizes to directly impact the price - a larger listing should have a higher price all else equal. There are 34 observations that are missing either a bedrooms or bathrooms value. If we look at these listings, it isn't clear what values should be imputed as there are a variety of room_types and accommodates values for each missing instance. Given the small number of missing points, we can safely remove these observations without dramatically altering the composition of the data. Then, comparing room types and sizes to log price, we can start with the room_type classification:
+
+```{r include=FALSE}
+airbnb <- airbnb %>% filter_at(vars(bedrooms, bathrooms), all_vars(!is.na(.)))
+```
+
+```{r}
+airbnb %>% ggplot(aes(x=room_type, y=log.price)) +
+  geom_boxplot() +
+  ggtitle("Room Type vs Log Price")
+
+airbnb %>% ggplot(aes(x=log.price, colour=room_type)) +
+  geom_density() +
+  ggtitle("Log Price Densities by Room Type")
+```
+
+The above plots illustrate that the room type has a substantial impact on price. The shared rooms are clearly the least expensive class of listing whereas entire home/apartment and hotel rooms tend to be on the higher end. Finally, the private rooms and entire home/apartment have the widest range with extremely high and extremely low values. They may be due to the wide range of possibilities that can be classified under these two categories. For example, both a studio apartment and a mansion could be in the entire home/apartment category. These differences are considered when we look at bedrooms, accommodates and bathrooms. Plotting each against log price,
+
+```{r}
+airbnb %>% select(log.price, bathrooms, accommodates, bedrooms) %>%
+  pivot_longer(-log.price, names_to="Category", values_to="Quantity") %>%
+  ggplot(aes(x=Quantity, y=log.price, colour=Category)) +
+  geom_point(alpha=0.2) +
+  facet_wrap(~Category, scales="free") +
+  theme(legend.position = "none") +
+  ggtitle("Listing Characteristics vs. Log Price")
+```
+
+The above plots suggest that the price is positively correlated with each of accommodates, bathrooms, and bedrooms as expected. More concretely:
+```{r}
+corr1 <- cor(airbnb %>% select(log.price, accommodates, bathrooms, bedrooms))
+ggcorrplot(corr1, type="lower", lab=TRUE)
+```
+
+We see that there is reasonably strong correlation between each of the features of interest. The log price is particularly strongly correlated with accommodates which suggests that there is a per head component of price.
+
+#### Review Scores
+
+Finally, lets look at the review scores columns. We noted in the data integrity section that there are roughly 4700 observations missing review scores. We will remove them here. Then, we can investigate the relationship between review scores and log price.
+
+```{r include=FALSE}
+airbnb <- airbnb %>% filter_at(vars(starts_with("review")), all_vars(!is.na(.)))
+```
+
+```{r}
+airbnb %>% select(log.price, review_scores_rating, number_of_reviews) %>%
+  pivot_longer(-log.price, names_to="Type", values_to="Value") %>%
+  ggplot(aes(x=Value, y=log.price)) +
+  geom_point() +
+  facet_wrap(~ Type, scales="free") +
+  ggtitle("Rating Score and Number of Reviews vs. Log Price")
+```
+
+The overall rating score versus log price is interesting. There seems to be a tendency to offer scores on multiples of 10 when the score is on the lower end. Also, all of the extremely high priced listings are in highest rating category. However, it is worth noting that the ratings with a high price and high score correspond to a small number of reviews. Part of the reason for this is that these expensive listings are far out of the price range of most guests and thus likely have fewer people staying in them. Considering the subcategories of the review score next:
+
+```{r}
+airbnb %>% select(log.price, starts_with("review")) %>%
+  select(-review_scores_rating) %>%
+  pivot_longer(-log.price, names_to="Category", values_to="Score") %>%
+  mutate(Category = gsub("review_scores_", "", Category)) %>% 
+  ggplot(aes(x=Score, y=log.price)) +
+  geom_point() +
+  facet_wrap(~ Category, ncol=3, scales="free") +
+  ggtitle("Review Score Subcategories vs. Log Price")
+```
+
+Similar to the overall rating, the most expensive listings have high scores across all categories. However, that does not imply that less expensive categories exclusively receive low scores as seen by the wide range of prices at the top end of the review scores. 
+
+Finally, we can look at the correlation matrix between the review score categories:
+```{r}
+corr2 <- cor(airbnb %>% select(log.price, contains("review")) %>% 
+               rename(location=review_scores_location,
+                      communication=review_scores_communication,
+                      checkin=review_scores_checkin,
+                      cleanliness=review_scores_cleanliness,
+                      accuracy=review_scores_accuracy,
+                      rating=review_scores_rating,
+                      number=number_of_reviews,
+                      value=review_scores_value))
+ggcorrplot(corr2, type="lower")
+```
+
+Note that in the above correlation matrix, all of the variables are positively correlated though the number of reviews and log price are clearly only weakly correlated with the review scores. The price specifically sees slightly stronger correlation with location which agrees with our discussion that location is a primary driver of listing price.
+
+In summary, certain variable categories seem to influence log price more than others. Specifically, the listing characteristics seem to be more influential than the host characteristics. The room type, number of bathrooms, bedrooms, and occupants along with the neighbourhood seemed to have the greatest impact. Second, the review scores seemed to have a relationship with price as categories such a location had a positive correlation and large prices exclusively had high scores. The host categories did not seem to have a meaningful relationship with the log price aside from the number of outliers in the host response time.
+
+## Part b
+
+Having explored the data and removed the difficult missing observations in reviews scores, host information and bed and bathrooms, we can begin to construct models for the purpose of predicting log price.
+
+### Model 1
+
+In the EDA we saw that the room_type seemed to be the most defining characteristic of a listing with respect to price. Thus, it seems reasonable to consider a model structured hierarchically with room_type. The rest of the variables are information at the listing level and thus should be introduced as unit level covariates. That is, the model can be written as follows:
+
+$$
+\begin{aligned}
+\alpha_j &\sim N(\mu_\alpha,\sigma^2_\alpha), \; \text{for} \; j=1,\dots,J \\
+y_i|\alpha_{j[i]} &\sim N(\alpha_{j[i]} + \beta^Tx_i,\sigma_y^2) \; \text{for} \; i=1,2,...,n \\
+\mu_\alpha &\sim N(0,1) \\
+\sigma^2_\alpha &\sim N_+(0,1) \\
+\sigma^2_y &\sim N_+(0,1) \\
+\beta_k &\sim N(0,1)
+\end{aligned}
+$$
+where $j$ represents the room_type number, $\alpha_j$ is the room_type level mean log price, $i$ is the observation number, $\beta$ is a vector of $k$ coefficients corresponding to all of the available covariates at the observation level, $x_i$ is the vector of covariate data for observation $i$, $n$ is the total number of observations, and $J$ is the total number of neighbourhoods.
+
+In order to run this model, we will need to one-hot encode the remaining categorical variables (host_response_time, neighbourhood), and convert room_type to room_type numbers. For the room_type point, as.factor followed by as.numeric will recode the values into numbers assigned alphabetically. Lastly, we will centre the numeric columns.
+
+```{r}
+print(levels(as.factor(airbnb$room_type)))
+abdata2 <- airbnb %>% 
+  select(-host_id, -host_since, -price) %>%
+  mutate(room_type = as.numeric(as.factor(room_type)))  %>%
+  mutate(temp = 1) %>%
+  pivot_wider(names_from=neighbourhood, values_from=temp, values_fill=list(temp=0)) %>%
+  mutate(temp = 1, 
+         host_response_time = ifelse(host_response_time=="N/A", "No Response", 
+                              ifelse(host_response_time=="within an hour", "Response_Hour",
+                              ifelse(host_response_time=="within a day", "Response_Day",
+                              ifelse(host_response_time=="within a few hours", 
+                                     "Response_Few_Hours", "Response_Few_Days"))))) %>%
+  pivot_wider(names_from=host_response_time, values_from=temp, values_fill=list(temp=0)) %>%
+  mutate(host_days_active = host_days_active - mean(host_days_active),
+         host_listings_count = host_listings_count - mean(host_listings_count),
+         bathrooms = bathrooms - mean(bathrooms),
+         accommodates = accommodates - mean(accommodates),
+         bedrooms = bedrooms - mean(bedrooms),
+         number_of_reviews = number_of_reviews - mean(number_of_reviews),
+         review_scores_rating = review_scores_rating - mean(review_scores_rating),
+         review_scores_accuracy = review_scores_accuracy - mean(review_scores_accuracy),
+         review_scores_cleanliness = review_scores_cleanliness - 
+           mean(review_scores_cleanliness),
+         review_scores_checkin = review_scores_checkin - mean(review_scores_checkin),
+         review_scores_communication = review_scores_communication - 
+           mean(review_scores_communication),
+         review_scores_location = review_scores_location - mean(review_scores_location),
+         review_scores_value = review_scores_value - mean(review_scores_value),) 
+```
+For future reference, note that 1 corresponds to entire home/apartment, 2 is hotel room, 3 is private room, and 4 is shared room.
+
+```{r cache=TRUE}
+sample2 <- abdata2 %>% sample_n(3000)
+xmat2 <- as.matrix(sample2 %>% select(-room_type, -log.price))
+dairbnbstan2 <- list(N = nrow(xmat2),
+                     J = max(abdata2$room_type),
+                     K = ncol(xmat2),
+                     room = sample2$room_type,
+                     xi = xmat2,
+                     yi = sample2$log.price)
+
+abmod2 <- stan(data = dairbnbstan2, 
+               file = "./airbnbmod2.stan",
+               iter = 2000,
+               seed = 123)
+```
+
+Now that the model has been completed (after a few hours) with 3000 samples and 2000 iterations, we can save the model so that we don't need to rerun it each time we knit. In order to run the stan model, uncomment the stan commands and comment out the readRDS commands.
+```{r}
+saveRDS(abmod2, "abfit2.rds")
+```
+
+#### Model 1 Diagnostics
+
+Running the model is certainly a victory but we must ensure that it has converged and that the diagnostics look good. First, check the maximum Rhat value
+```{r}
+#Load in the model
+#abmod2 <- readRDS("abfit2.rds")
+max(summary(abmod2)$summary[,c("Rhat")])
+```
+
+1.12 is certainly not ideal. Let's investigate where this is coming from.
+```{r}
+summary(abmod2)$summary[summary(abmod2)$summary[,"Rhat"] >= 1.1, 
+                        c("mean", "se_mean", "n_eff", "Rhat")]
+```
+The coefficients that seem to have not fully converged are all covariates corresponding to one-hot encoded neighbourhoods. Specifically, the 1.127767 corresponds to Waterfront Communities-The Island, a neighbourhood discussed earlier with a very wide range of listing prices. Let's now focus on the group means, non-neighbourhood covariates, and $\mu$,$\sigma$ parameters. 
+
+```{r}
+summary(abmod2)$summary[c(paste0("alpha[", 1:4, "]"),
+                          paste0("beta[", 1:14, "]"), "mu", "sigma_a", "sigma_y"),
+                        c("mean", "se_mean", "n_eff", "Rhat")]
+```
+
+In the above, we can see that all of the variables of interest have converged with low Rhat values and reasonable effective sample sizes. Notice that the alpha values do have sizable differences suggesting that our intuition of the groups being materially different has merit. 
+
+Next, check the trace plots and density plots. We'll start with the alphas:
+```{r}
+pars = c(paste0("alpha[", 1:4, "]"))
+traceplot(abmod2, pars=pars)
+```
+
+```{r}
+stan_dens(abmod2, separate_chains=TRUE, pars=pars)
+```
+
+In the above plots, it would appear that the alpha values are mixing quite well. The chains do not appear to be diverging and exploring different regions and there does not seem to be a clear pattern in the trace plots.
+
+```{r}
+pairs(abmod2, pars=pars)
+```
+
+Finally, the pairs and the density plots indicates that the densities of the alpha terms are roughly normal and highly correlated.
+
+Moving to the $\mu$ and $\sigma$ parameters,
+```{r}
+pars = c("mu", "sigma_a", "sigma_y")
+traceplot(abmod2, pars=pars)
+stan_dens(abmod2, separate_chains=TRUE, pars=pars)
+pairs(abmod2, pars=pars)
+```
+
+Once again, the parameters do appear to be mixing quite well and the chains seems to be exploring the same region indicating convergence.
+
+### Model 2
+
+In the EDA section, we touched on how accommodates, bedrooms, and bathrooms are closely related. It may be interesting to consider whether an additional bedroom or bathroom in an entire residence is worth more than in say a hotel room. For this, we will once again use a room_type hierarchical structure but now allow varying slopes over these three covariates. The model is then:
+
+$$
+\begin{aligned}
+\begin{pmatrix} \alpha_j \\ \gamma_j \end{pmatrix} &\sim MVN_4\left(\mu, \tau\Omega\tau^T\right) \\
+\alpha_j &\sim N(\mu_\alpha,\sigma^2_\alpha), \; \text{for} \; j=1,2,\dots,J \\
+y_i|\alpha_{j[i]} &\sim N(\alpha_{j[i]} + \beta^Tx_i + \gamma_{j[i]}^Tz_i,\sigma_y^2) \; \text{for} \; i=1,2,...,n \\
+\mu &\sim N_4(0,1) \\
+\tau &\sim \text{Cauchy}(0,2.5) \\
+\Omega &\sim LKJ(2)\\
+\sigma^2_y &\sim N_+(0,1) \\
+\beta_k &\sim N(0,1) \\
+\end{aligned}
+$$
+where $j$ represents the room_type number, $\alpha_j$ is the room_type mean log price, $\gamma_j$ is a vector containing the three varying slope terms for room_type $j$, $i$ is the observation number, $\beta$ is a vector of $k$ coefficients corresponding to all of the available non-varying covariates at the observation level, $x_i$ is the vector of non-varying covariate data for observation $i$, $z_i$ is the vector of varying covariate data for observation $i$, $n$ is the total number of observations, and $J$ is the total number of neighbourhoods. Note that the prior distributions over $\tau$ and $\Omega$ are recommendations for covariance matrices of multivariate normals offered by Stan. $\tau$ is the vector of scale factors and $\Omega$ is a correlation matrix of $\alpha$ and $\gamma$.
+
+Using the same data as model 1, this time we can remove the accommodates, bathrooms, and bedrooms categories and put them in a separate matrix for input into stan. Once again with a sample of 3000 samples and 2000 iterations, the model does converge.
+```{r cache=TRUE}
+sample3 <- abdata2 %>% sample_n(3000)
+xmat3 <- as.matrix(sample3 %>% select(-room_type, -log.price, -accommodates, 
+                                      -bedrooms, -bathrooms))
+zmat3 <- as.matrix(sample3 %>% select(accommodates, bathrooms, bedrooms))
+dairbnbstan3 <- list(N = nrow(xmat3),
+                     J = max(abdata2$room_type),
+                     K = ncol(xmat3),
+                     L = ncol(zmat3),
+                     room = sample3$room_type,
+                     xi = xmat3,
+                     zi = zmat3,
+                     yi = sample3$log.price)
+
+abmod3 <- stan(data = dairbnbstan3, 
+               file = "./airbnbmod3.stan",
+               iter = 2000,
+               seed = 123)
+```
+
+```{r}
+saveRDS(abmod3, "abfit3.rds")
+```
+
+#### Model 2 Diagnostics
+
+Let's now start with the Rhat values. First checking the maximum value:
+```{r}
+#Load in the model
+#abmod3 <- readRDS("abfit3.rds")
+max(summary(abmod3)$summary[,"Rhat"])
+max(summary(abmod3)$summary[-161,"Rhat"])
+```
+The NaN seems rather strange. However, there is actually a very reasonable explanation for this. It occurs in the correlation matrix $\Omega$. Removing this line, we see that the maximum Rhat is 1.037, a much more pleasant value.
+
+```{r}
+summary(abmod3)$summary[c(paste0("Omega[1,",1:4,"]"),
+                          paste0("Omega[2,",1:4,"]"),
+                          paste0("Omega[3,",1:4,"]"),
+                          paste0("Omega[4,",1:4,"]")), 
+                        c("mean", "se_mean", "n_eff", "Rhat")]
+
+```
+
+The NaN is a value from the diagonal of the correlation matrix. It's presence indicates that all values in the chain were constant. As the diagonal of a correlation matrix must be 1, it failing to deviate is by no means problematic. While we have the Omega value printed, notice just how close they all are to 1. As all of the other Rhat values are less than 1.037, we are happy with this diagnostic. 
+
+```{r}
+summary(abmod3)$summary[c(paste0("ag[1,",1:4,"]"),
+                          paste0("ag[2,",1:4,"]"),
+                          paste0("ag[3,",1:4,"]"),
+                          paste0("ag[4,",1:4,"]")), 
+                        c("mean", "se_mean", "n_eff", "Rhat")]
+```
+Looking at the output for the $\alpha$ and $\gamma$ terms, the effective sample size is always greater than 200 and the Rhat is essentially 1. Given these are the parameters of the most complex part of our model structure, this is a good sign that the model converged
+
+Turning to the trace plots and density plots:
+
+```{r}
+pars = c(paste0("ag[1,", 1:4, "]"))
+traceplot(abmod3, pars=pars)
+pars = c(paste0("ag[2,", 1:4, "]"))
+traceplot(abmod3, pars=pars)
+pars = c(paste0("ag[3,", 1:4, "]"))
+traceplot(abmod3, pars=pars)
+pars = c(paste0("ag[4,", 1:4, "]"))
+traceplot(abmod3, pars=pars)
+```
+
+In the above trace plots for alpha and gamma terms, it seems that each variable is mixing quite well. It does appear that the alpha terms (top left) are mixing slightly less well though there does not appear to be any overall trend or suggestion that the chain is still attempting to move towards stationarity.
+
+```{r}
+pars = c(paste0("ag[1,", 1:4, "]"))
+stan_dens(abmod3, separate_chains=TRUE, pars=pars)
+pairs(abmod3, pars=pars)
+pars = c(paste0("ag[2,", 1:4, "]"))
+stan_dens(abmod3, separate_chains=TRUE, pars=pars)
+pairs(abmod3, pars=pars)
+pars = c(paste0("ag[3,", 1:4, "]"))
+stan_dens(abmod3, separate_chains=TRUE, pars=pars)
+pairs(abmod3, pars=pars)
+pars = c(paste0("ag[4,", 1:4, "]"))
+stan_dens(abmod3, separate_chains=TRUE, pars=pars)
+pairs(abmod3, pars=pars)
+```
+
+Looking at the density plots now, it would appear that the chains have all converged to the same distributions. The pairs plots further our confidence that Model 3 has converged. 
+
+## Part c
+
+To compare the models, we can use LOO-CV.
+
+```{r warning=FALSE}
+loglik2 <- as.matrix(abmod2, pars="log_lik")
+loglik3 <- as.matrix(abmod3, pars="log_lik")
+
+loo2 <- loo(loglik2, save_psis=TRUE)
+loo3 <- loo(loglik3, save_psis=TRUE)
+```
+
+```{r}
+loo_compare(loo2,loo3)
+```
+
+From the comparison, we can see that the ELPD of loo3 which corresponds to our varying slopes model is much higher than the constant slopes model. Thus we prefer Model 2.
+
+## Part d
+
+To interpret our model, lets start with looking at the covariate coefficients and group level items and then proceed to visualise. Given the varying slopes structure, we also have interesting correlation/covariance matrices to look at.
+
+Let's start with the group means and varying slopes. The following table summarizes the coefficient estimates.
+```{r}
+ag <- matrix(summary(abmod3)$summary[c(paste0("ag[1,",1:4,"]"),
+                                       paste0("ag[2,",1:4,"]"),
+                                       paste0("ag[3,",1:4,"]"),
+                                       paste0("ag[4,",1:4,"]")), "mean"], 
+             ncol=4, byrow=TRUE)
+rownames(ag) <- levels(airbnb$room_type)
+colnames(ag) <- c("Alpha",colnames(zmat3))
+kable(ag)
+```
+
+The most interesting component of this table is that the slopes of the bathrooms coefficients are negative in all cases other than entire home/apartment. Of all of the groups, we would only expect the entire home/apartment category to have the bathroom number act as a proxy for the size of the house and by extension price. We wouldn't expect to have say a 5 bathroom hotel room listed. Further, there's only one hotel room listing with 3 bathrooms, the maximum in this room_type. The limited data may also be playing a part in the negative coefficient. Turning to the group means, they are in line with our general expectations. Staying at a hotel room is more expensive than a personal residence which is then more expensive that just a room. A final interesting observation is that the log price grows with the accommodates number in all cases. This is more interesting when we see that hotel room and private room prices grow the fastest with the capacity. This makes sense in the context of these categories as increasing capacity may involve transitioning from a single room/studio to a suite. 
+
+Visually, the accommodates slopes and alpha intercepts can be viewed as follows:
+```{r fig.width=6, fig.height=4}
+aa <- data.frame(ag[,1:2]) %>% 
+  mutate(Type = rownames(ag)) %>%
+  slice(rep(1:n(), each=11)) %>%
+  group_by(Type) %>%
+  mutate(Capacity = 0:10) %>%
+  ungroup() %>%
+  mutate(log.price.mean = Alpha + accommodates*Capacity) %>%
+  mutate(price.mean=exp(log.price.mean)) %>% 
+  pivot_longer(log.price.mean:price.mean, names_to="Category", values_to="Mean.Prices")
+aa %>% ggplot(aes(x=Capacity, y=Mean.Prices, colour=Type)) +
+  geom_line() + 
+  geom_point() +
+  theme(legend.position="bottom") +
+  facet_wrap(~ Category, scales="free") +
+  ggtitle("Listing Prices and Accommodation Capacity")
+```
+
+The above plot summarises the effects of the capacity of a listing (ie. accommodates) on the mean price and log price. We can see that the rates of change are different and that hotels are just by far the most expensive category, shared rooms are the least expensive and private rooms grow in price faster than entire residences. While a 10 person private room doesn't happen in reality, the underlying logic is that to find a room that can accommodate more people is more difficult than to add an extra person to a residence where there tends to be more flexibility. Let's consider the variability by adding a credibility interval around the price.mean values.
+
+```{r fig.width=6, fig.height=4}
+aa2 <- data.frame(ag[,1:2]) %>% 
+  mutate(Type = rownames(ag)) %>%
+  bind_cols(data.frame(Alpha2.5 = summary(abmod3)$summary[paste0("ag[",1:4,",1]"),"2.5%"],
+                       Alpha97.5 = summary(abmod3)$summary[paste0("ag[",1:4,",1]"),"97.5%"],
+                       Accom2.5 = summary(abmod3)$summary[paste0("ag[",1:4,",2]"),"2.5%"],
+                       Accom97.5 = summary(abmod3)$summary[paste0("ag[",1:4,",2]"),"97.5%"])) %>%
+  slice(rep(1:n(), each=6)) %>%
+  group_by(Type) %>%
+  mutate(Capacity = 0:5) %>%
+  ungroup() %>%
+  mutate(log.price.lower = Alpha2.5 + Accom2.5*Capacity,
+         log.price.mean = Alpha + accommodates*Capacity,
+         log.price.upper = Alpha97.5 + Accom97.5*Capacity) %>%
+  mutate(price.lower=exp(log.price.lower),
+         price.mean=exp(log.price.mean),
+         price.upper=exp(log.price.upper)) %>% 
+  select(-log.price.mean, -log.price.lower, -log.price.upper)
+aa2 %>% ggplot(aes(x=Capacity, y=price.mean, colour=Type)) +
+  geom_line() + 
+  geom_point() + 
+  geom_errorbar(aes(ymin=price.lower, ymax=price.upper)) + 
+  theme(legend.position="none") +
+  facet_wrap(~ Type, scales="free") +
+  ggtitle("Listing Prices and Accommodation Capacity (with 95% CI)")
+```
+
+The above plot illustrates the uncertainty in the model. The points represent the prices computed with the point estimates of the slope of accommodates for each room_type. The error bars compute the same price using the 2.5% and 97.5% quantile values of the accommodates parameters. The error appears so explosive because it is multiplied each time the capacity is increased by 1 and then exponentiated to recover the actual price from the log price. Thus in a model involving log targets, we hope to be comfortable with the values closer to the point estimate.
+
+We can conduct a similar analysis using the bedrooms and bathrooms coefficients. However, given that these are much more closely related, we want to consider bedrooms and bathrooms together and so we have 3 variables of interest. A tile plot is well suited to this problem.
+
+```{r fig.width=6, fig.height=4, warning=FALSE}
+bb <- data.frame(ag) %>% 
+  mutate(room_type = rownames(ag)) %>%
+  inner_join(airbnb %>% group_by(room_type) %>% 
+               summarise(mean.accom=mean(accommodates)),by="room_type") %>%
+  rename(Type = room_type) %>%
+  slice(rep(1:n(), each=5)) %>%
+  group_by(Type) %>%
+  mutate(Beds = 1:5) %>%
+  ungroup() %>%
+  slice(rep(1:n(), each=5)) %>%
+  group_by(Type, Beds) %>%
+  mutate(Baths = 1:5) %>%
+  mutate(log.price.mean = Alpha + bathrooms*Baths + bedrooms*Beds + 
+           accommodates*mean.accom) %>%
+  mutate(price.mean=floor(exp(log.price.mean)))
+bb %>% ggplot(aes(x=Beds, y=Baths)) +
+  geom_tile(aes(fill=price.mean)) + 
+  theme(legend.position="bottom") +
+  facet_wrap(~ Type, ncol=2) +
+  geom_text(aes(label=price.mean)) +
+  scale_fill_gradient(low="white", high="sea green") +
+  theme(legend.position = "none") +
+  ggtitle("Listing Prices and Bedrooms/Bathrooms (2 Person Capacity)")
+```
+
+The above plot provides price estimates by room type based on the number of bedrooms and bath rooms. Notice that as expected, the entire home/apartments are the most expensive due to the higher average accomodation, followed by hotel rooms (with reasonable bathroom numbers), then private rooms and shared rooms. Note that these value are based on room_type average accommodation, average values in constant slope covariates and reference categories. This is not necessarily realistic for shared rooms as they are concentrated in certain neighbourhoods and are far from average in other covariates. Thus the prices for that class are understated. A similar but more muted effect is experienced by the hotel room class that is slightly understated as well. However, the patterns and variation are the same and the trend in prices does hold. It is interesting to see the rate of growth is much faster with the larger listing size entire home/apartment class. We can also visually see the premium paid to stay in a private versus a shared room.
+
+```{r}
+omega <- matrix(summary(abmod3)$summary[c(paste0("Omega[1,",1:4,"]"),
+                                          paste0("Omega[2,",1:4,"]"),
+                                          paste0("Omega[3,",1:4,"]"),
+                                          paste0("Omega[4,",1:4,"]")), "mean"], ncol=4, byrow=TRUE)
+rownames(omega) <- c("Alpha",colnames(zmat3))
+colnames(omega) <- c("Alpha",colnames(zmat3))
+kable(omega)
+```
+
+The above correlation matrix summarises some of the patterns observed. It contains the correlations between coefficients in the alpha-gamma matrix. Most of these values are small, indicating only slight covariance between variables though the negative correlation between accommodates and bathrooms is interesting. It seems to be a result of the hotel room category where a large number of bathrooms is not observed so the negative coefficient moderates the large accommodates coefficient. That same effect seems to be observed in the other variables to a lesser extent. Bathrooms acts to rein in large increases in other varying variables.
+
+Having looked at the group means and varying slopes covariates, let's think about the constant covariates and how they impact prices and log prices. We will focus on neighbourhoods as they had larger coefficients than any other variable. Specifically, we can plot the values and 95% credible intervals for the 20 largest absolute coefficients.
+
+```{r fig.width=6, fig.height=4}
+nbstart <- which(colnames(xmat3) == "Little Portugal")
+nbend <- which(colnames(xmat3) == "Rustic")
+
+nbhoodest <- data.frame(Variable = colnames(xmat3)[nbstart:nbend],
+                        summary(abmod3)$summary[paste0("beta[",nbstart:nbend,"]"),
+                                                c("2.5%", "50%", "97.5%")]) %>%
+  rename(CI.Lower = X2.5., Median = X50., CI.Upper = X97.5.)
+rownames(nbhoodest) <- c()
+
+topnbhood <- nbhoodest %>% 
+  mutate(absmed = abs(Median)) %>%
+  top_n(20, absmed) %>% 
+  select(-absmed) %>%
+  mutate(extreme = ifelse(Median >= 0, "Highest", "Lowest"))
+
+topnbhood %>% ggplot(aes(x=Median, y=Variable, colour=extreme)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin=CI.Lower, xmax=CI.Upper)) +
+  theme(legend.position = "bottom") +
+  ylab("Neighbourhood") + 
+  xlab("Beta Coefficient") +
+  ggtitle("Highest and Lowest Neighbourhoods")
+```
+
+The above plot provides estimates and 95% credibility intervals for the 20 largest absolute coefficients. These neighbourhoods have the greatest departure from the global mean price of a listing in their region. Notice that Black Creek stands out as dramatically cheaper than any other neighbourhood. This is consistent with the actual low prices in the data. On the other hand, Casa Loma breaks away at the top end though by a smaller amount than Black Creek. These results confirm our initial suspicions that neighbourhood does have an impact on price. It seems there is merit to the "location is everything" mantra in real estate!
+
+In summary, the varying slopes model seems to successfully capture the differences in room_type as they relate to listing level characteristics. In addition, we can see that the listing level covariates do still impact the log price as seen with the neighbourhoods.
+
+## Part e
+
+Once again, we will train the model on a sample of 3000. However, this time, that 3000 will be drawn from 80% of the data with the remaining 20% set aside for testing.
+
+```{r warning=FALSE}
+set.seed(1234)
+abdata3 <- abdata2 %>% mutate(index = 1:n())
+train <- abdata3 %>% sample_n(floor(nrow(abdata3)*0.8))
+test <- abdata3 %>% anti_join(train, by="index") %>% select(-index)
+trainsamp <- train %>% select(-index) %>% sample_n(3000)
+xmat4 <- as.matrix(trainsamp %>% select(-room_type, -log.price, 
+                                        -accommodates, -bedrooms, -bathrooms))
+zmat4 <- as.matrix(trainsamp %>% select(accommodates, bathrooms, bedrooms))
+dairbnbstan4 <- list(N = nrow(xmat4),
+                     J = max(abdata3$room_type),
+                     K = ncol(xmat4),
+                     L = ncol(zmat4),
+                     room = trainsamp$room_type,
+                     xi = xmat4,
+                     zi = zmat4,
+                     yi = trainsamp$log.price)
+
+ab3test <- stan(data = dairbnbstan4, 
+                file = "./airbnbmod3.stan",
+                iter = 2000,
+                seed = 123)
+saveRDS(ab3test, "ab3test.rds")
+#ab3test <- readRDS("ab3test.rds")
+```
+
+```{r}
+max(summary(ab3test)$summary[-161,"Rhat"])
+```
+Once again, checking the maximum Rhat values excluding the Omega[1,1] entry, we see that the model has converged. Now, let's test it on the test set:
+```{r}
+xtest <- as.matrix(test %>% select(-room_type, -log.price,
+                                   -accommodates, -bedrooms, -bathrooms))
+ztest <- as.matrix(test %>% select(accommodates, bathrooms, bedrooms))
+rttest <- test %>% select(room_type)
+betatest <- summary(ab3test)$summary[paste0("beta[",1:156,"]"),"mean"]
+alphahat <- summary(ab3test)$summary[paste0("ag[",1:4,",1]"),"mean"]
+alphatest <- as.matrix(rttest %>% transmute(alpha = alphahat[room_type]))
+gammazhat <- as.matrix(rttest %>% transmute(gamma1 = summary(ab3test)$summary[paste0("ag[",room_type,",2]"),"mean"],
+                                            gamma2 = summary(ab3test)$summary[paste0("ag[",room_type,",3]"),"mean"],
+                                            gamma3 = summary(ab3test)$summary[paste0("ag[",room_type,",4]"),"mean"]))
+yhat = alphatest + xtest %*% betatest + rowSums(ztest * gammazhat)
+
+testerr <- data.frame(error=(yhat-test$log.price)^2) %>% rename(error = alpha)
+
+testerr %>% 
+  summarise(mse = mean(error)) %>% 
+  transmute(rmse = sqrt(mse))
+testerr %>% 
+  bind_cols(rttest) %>% 
+  group_by(room_type) %>% 
+  summarise(mse = mean(error)) %>% 
+  mutate(rmse = sqrt(mse)) %>%
+  mutate(room_type = levels(airbnb$room_type)) %>%
+  select(-mse)
+```
+
+Overall, the mode's RMSE is 0.4276. When separated into room_types, the highest RMSE is for the hotel room category followed by shared room, then entire home/apartment and private room. The hotel rooms and shared rooms are the smallest categories (74 hotel rooms and 224 shared rooms) and with the limited data, we expect the error to be slightly higher. However, all of the RMSE values are less than one which is promising. We aren't seeing dramatic error in our model! We can conclude that the varying slopes model is performing quite well.
+
