@@ -2,9 +2,11 @@
 title: "STA 2201H Take-Home Exam Solutions"
 author: "Ameer Dharamshi"
 date: "April 14, 2020"
-output: 
-  pdf_document:
-    number_sections: true
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
 ---
 
 ```{r setup, include=FALSE}
@@ -25,7 +27,10 @@ set.seed(2201)
 options(mc.cores=4)
 ```
 
-## Introduction
+# Introduction
+
+
+
 
 First, import the data:
 ```{r}
@@ -38,7 +43,7 @@ airbnb <- airbnb %>%
          price = as.integer(price))
 ```
 
-### Data integrity checks
+## Data integrity checks
 
 Let's start by performing basic data integrity checks. First, lets check for duplicates.
 
@@ -113,9 +118,9 @@ airbnb <- airbnb %>%
 
 For now, we have just removed the observations with bad price data. Given that the columns lacking review and host information do still have a price value, they are useful in assessing the distribution of listing prices and can be removed before considering the relationships between price and the missing covariates.
 
-### Exploratory Data Analysis
+# Exploratory Data Analysis
 
-#### Price
+## Price
 
 Recalling our listing price modelling objective, let's begin by considering the distribution of price and log(price).
 ```{r}
@@ -132,7 +137,7 @@ airbnb %>%
 
 The above plot tells us that the price data is heavily concentrated in the under $1000 price range and even moreso in the lower end of that bucket. Noting how dramatically right-skewed the distribution is, it will be better to model the log price instead as it offers a more normal shape.
 
-#### Neighbourhoods
+## Neighbourhoods
 
 Earlier on, we conjectured that neighbourhoods would be a defining characteristic of price as certain neighbourhoods are more desirable than others. Now, we can investigate the relationship between neighbourhood and price.
 ```{r fig.height=12}
@@ -153,7 +158,7 @@ airbnb %>%
 While perhaps a little busy, the above plot confirms our suspicions. We see that there are certain neighbourhoods with mean log price much higher than the average such as Waterfront Communities - The Island and some with much lower values such as Glenfield - Jane Heights. This suggests that neighbourhood could be a good option to structure a hierarchical model with.
 
 
-#### Host Information
+## Host Information
 
 Next, lets consider the host related columns and how they impact price. We noted above that there were 283 observations that were missing all host information. We will remove them here. First, we will need to construct a Then, we can investigate the relationship of each host variable with log price 
 
@@ -210,7 +215,7 @@ There does not appear to be a strong relationship between the days the host has 
 
 In summary, the host information does not seem to have a strong relationship with price aside from possibly host response time acting as a proxy for host quality. However, there is no harm in using the variables in our models at first to extract any information they do contain.
 
-#### Room Types and Sizes
+## Room Types and Sizes
 
 Similar to the neighbourhood variable, we expect the room types and sizes to directly impact the price - a larger listing should have a higher price all else equal. There are 34 observations that are missing either a bedrooms or bathrooms value. If we look at these listings, it isn't clear what values should be imputed as there are a variety of room_types and accommodates values for each missing instance. Given the small number of missing points, we can safely remove these observations without dramatically altering the composition of the data. Then, comparing room types and sizes to log price, we can start with the room_type classification:
 
@@ -248,7 +253,7 @@ ggcorrplot(corr1, type="lower", lab=TRUE)
 
 We see that there is reasonably strong correlation between each of the features of interest. The log price is particularly strongly correlated with accommodates which suggests that there is a per head component of price.
 
-#### Review Scores
+## Review Scores
 
 Finally, lets look at the review scores columns. We noted in the data integrity section that there are roughly 4700 observations missing review scores. We will remove them here. Then, we can investigate the relationship between review scores and log price.
 
@@ -298,11 +303,11 @@ Note that in the above correlation matrix, all of the variables are positively c
 
 In summary, certain variable categories seem to influence log price more than others. Specifically, the listing characteristics seem to be more influential than the host characteristics. The room type, number of bathrooms, bedrooms, and occupants along with the neighbourhood seemed to have the greatest impact. Second, the review scores seemed to have a relationship with price as categories such a location had a positive correlation and large prices exclusively had high scores. The host categories did not seem to have a meaningful relationship with the log price aside from the number of outliers in the host response time.
 
-## Part b
+# Modelling
 
 Having explored the data and removed the difficult missing observations in reviews scores, host information and bed and bathrooms, we can begin to construct models for the purpose of predicting log price.
 
-### Model 1
+## Model 1 - Room Type Hierarchy with Fixed Effects
 
 In the EDA we saw that the room_type seemed to be the most defining characteristic of a listing with respect to price. Thus, it seems reasonable to consider a model structured hierarchically with room_type. The rest of the variables are information at the listing level and thus should be introduced as unit level covariates. That is, the model can be written as follows:
 
@@ -362,15 +367,15 @@ dairbnbstan2 <- list(N = nrow(xmat2),
                      xi = xmat2,
                      yi = sample2$log.price)
 
-abmod2 <- stan(data = dairbnbstan2, 
-               file = "./airbnbmod2.stan",
-               iter = 2000,
-               seed = 123)
+#abmod2 <- stan(data = dairbnbstan2, 
+#               file = "./airbnbmod2.stan",
+#               iter = 2000,
+#               seed = 123)
 ```
 
 Now that the model has been completed (after a few hours) with 3000 samples and 2000 iterations, we can save the model so that we don't need to rerun it each time we knit. In order to run the stan model, uncomment the stan commands and comment out the readRDS commands.
 ```{r}
-saveRDS(abmod2, "abfit2.rds")
+#saveRDS(abmod2, "abfit2.rds")
 ```
 
 #### Model 1 Diagnostics
@@ -378,7 +383,7 @@ saveRDS(abmod2, "abfit2.rds")
 Running the model is certainly a victory but we must ensure that it has converged and that the diagnostics look good. First, check the maximum Rhat value
 ```{r}
 #Load in the model
-#abmod2 <- readRDS("abfit2.rds")
+abmod2 <- readRDS("abfit2.rds")
 max(summary(abmod2)$summary[,c("Rhat")])
 ```
 
@@ -425,7 +430,7 @@ pairs(abmod2, pars=pars)
 
 Once again, the parameters do appear to be mixing quite well and the chains seems to be exploring the same region indicating convergence.
 
-### Model 2
+## Model 2 - Room Type Hierarchy with Mixed Effects
 
 In the EDA section, we touched on how accommodates, bedrooms, and bathrooms are closely related. It may be interesting to consider whether an additional bedroom or bathroom in an entire residence is worth more than in say a hotel room. For this, we will once again use a room_type hierarchical structure but now allow varying slopes over these three covariates. The model is then:
 
@@ -458,22 +463,25 @@ dairbnbstan3 <- list(N = nrow(xmat3),
                      zi = zmat3,
                      yi = sample3$log.price)
 
-abmod3 <- stan(data = dairbnbstan3, 
-               file = "./airbnbmod3.stan",
-               iter = 2000,
-               seed = 123)
+#abmod3 <- stan(data = dairbnbstan3, 
+#               file = "./airbnbmod3.stan",
+#               iter = 2000,
+#               seed = 123)
 ```
 
 ```{r}
-saveRDS(abmod3, "abfit3.rds")
+#saveRDS(abmod3, "abfit3.rds")
 ```
 
-#### Model 2 Diagnostics
+### Diagnostics {.tabset}
+
+
+#### Discussion
 
 Let's now start with the Rhat values. First checking the maximum value:
 ```{r}
 #Load in the model
-#abmod3 <- readRDS("abfit3.rds")
+abmod3 <- readRDS("abfit3.rds")
 max(summary(abmod3)$summary[,"Rhat"])
 max(summary(abmod3)$summary[-161,"Rhat"])
 ```
@@ -499,20 +507,37 @@ summary(abmod3)$summary[c(paste0("ag[1,",1:4,"]"),
 ```
 Looking at the output for the $\alpha$ and $\gamma$ terms, the effective sample size is always greater than 200 and the Rhat is essentially 1. Given these are the parameters of the most complex part of our model structure, this is a good sign that the model converged
 
-Turning to the trace plots and density plots:
+#### Trace Plots {.tabset}
 
+##### Entire Home/Apartment
 ```{r}
 pars = c(paste0("ag[1,", 1:4, "]"))
 traceplot(abmod3, pars=pars)
+```
+
+
+##### Hotel Room
+```{r}
 pars = c(paste0("ag[2,", 1:4, "]"))
 traceplot(abmod3, pars=pars)
+```
+
+
+##### Private Room
+```{r}
 pars = c(paste0("ag[3,", 1:4, "]"))
 traceplot(abmod3, pars=pars)
+```
+
+##### Shared Room
+```{r}
 pars = c(paste0("ag[4,", 1:4, "]"))
 traceplot(abmod3, pars=pars)
 ```
 
 In the above trace plots for alpha and gamma terms, it seems that each variable is mixing quite well. It does appear that the alpha terms (top left) are mixing slightly less well though there does not appear to be any overall trend or suggestion that the chain is still attempting to move towards stationarity.
+
+#### Density and Pairs Plots
 
 ```{r}
 pars = c(paste0("ag[1,", 1:4, "]"))
@@ -690,7 +715,7 @@ The above plot provides estimates and 95% credibility intervals for the 20 large
 
 In summary, the varying slopes model seems to successfully capture the differences in room_type as they relate to listing level characteristics. In addition, we can see that the listing level covariates do still impact the log price as seen with the neighbourhoods.
 
-## Part e
+# Testing the Model
 
 Once again, we will train the model on a sample of 3000. However, this time, that 3000 will be drawn from 80% of the data with the remaining 20% set aside for testing.
 
@@ -712,12 +737,12 @@ dairbnbstan4 <- list(N = nrow(xmat4),
                      zi = zmat4,
                      yi = trainsamp$log.price)
 
-ab3test <- stan(data = dairbnbstan4, 
-                file = "./airbnbmod3.stan",
-                iter = 2000,
-                seed = 123)
-saveRDS(ab3test, "ab3test.rds")
-#ab3test <- readRDS("ab3test.rds")
+#ab3test <- stan(data = dairbnbstan4, 
+#                file = "./airbnbmod3.stan",
+#                iter = 2000,
+#                seed = 123)
+#saveRDS(ab3test, "ab3test.rds")
+ab3test <- readRDS("ab3test.rds")
 ```
 
 ```{r}
@@ -753,3 +778,4 @@ testerr %>%
 
 Overall, the mode's RMSE is 0.4276. When separated into room_types, the highest RMSE is for the hotel room category followed by shared room, then entire home/apartment and private room. The hotel rooms and shared rooms are the smallest categories (74 hotel rooms and 224 shared rooms) and with the limited data, we expect the error to be slightly higher. However, all of the RMSE values are less than one which is promising. We aren't seeing dramatic error in our model! We can conclude that the varying slopes model is performing quite well.
 
+# Conclusions
