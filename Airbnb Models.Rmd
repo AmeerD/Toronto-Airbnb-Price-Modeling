@@ -1,7 +1,7 @@
 ---
-title: "STA 2201H Take-Home Exam Solutions"
+title: "Modelling Airbnb Listing Prices in Toronto"
 author: "Ameer Dharamshi"
-date: "April 14, 2020"
+date: "April 28, 2020"
 output:
   html_document:
     toc: true
